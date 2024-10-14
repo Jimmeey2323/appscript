@@ -1,0 +1,704 @@
+function runAllScripts() {
+  const loginHeaders = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  };
+
+  const loginPayload = {
+    email: 'jimmeey@physique57india.com',
+    password: 'Jimmeey@123',
+  };
+
+  const cookie = authenticateAndGetCookie(loginHeaders, loginPayload);
+  if (!cookie) {
+    Logger.log('Authentication failed. Aborting all data retrieval.');
+    return;
+  }
+
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  fetchAndAppendBookingsDataAPI(spreadsheet, cookie);
+  fetchAndAppendSalesData(spreadsheet, cookie);
+  fetchAndAppendNewMembers(spreadsheet, cookie);
+  fetchAndAppendSessionsData(spreadsheet, cookie);
+}
+
+function authenticateAndGetCookie(loginHeaders, loginPayload) {
+  try {
+    const loginResponse = UrlFetchApp.fetch('https://api.momence.com/auth/login', {
+      method: 'POST',
+      headers: loginHeaders,
+      payload: JSON.stringify(loginPayload),
+    });
+
+    if (loginResponse.getResponseCode() !== 200) {
+      Logger.log('Authentication failed. Check your credentials.');
+      return null;
+    }
+
+    return loginResponse.getHeaders()['Set-Cookie'];
+  } catch (error) {
+    Logger.log('Error during authentication: ' + error.message);
+    return null;
+  }
+}
+
+function fetchAndAppendBookingsDataAPI(spreadsheet, cookie) {
+  const endpoints = {
+    Bookings: [
+      'https://reports-api.momence.com/host/13752/reports/session-bookings?includeVatInRevenue=true&timeZone=Asia%2FCalcutta&BookedEntityDateRange=false&excludeMembershipRenews=false&locationId=29821',
+      'https://reports-api.momence.com/host/13752/reports/session-bookings?includeVatInRevenue=true&timeZone=Asia%2FCalcutta&BookedEntityDateRange=false&excludeMembershipRenews=false&locationId=11699',
+      'https://reports-api.momence.com/host/13752/reports/session-bookings?includeVatInRevenue=true&timeZone=Asia%2FCalcutta&BookedEntityDateRange=false&excludeMembershipRenews=false&locationId=9030',
+      'https://reports-api.momence.com/host/33905/reports/session-bookings?includeVatInRevenue=true&timeZone=Asia%2FCalcutta&BookedEntityDateRange=false&excludeMembershipRenews=false'
+    ]
+  };
+
+  const dataHeaders = {
+    'Accept': 'application/json',
+    'Cookie': cookie,
+  };
+
+  for (const sheetName in endpoints) {
+    const dataUrls = endpoints[sheetName];
+    const sheet = getOrCreateSheet(spreadsheet, sheetName);
+
+    let headerAppended = false;
+
+    for (const url of dataUrls) {
+      try {
+        const dataResponse = UrlFetchApp.fetch(url, {
+          method: 'GET',
+          headers: dataHeaders,
+        });
+
+        if (dataResponse.getResponseCode() !== 200) {
+          Logger.log('Data retrieval failed for ' + sheetName + ' sheet from URL: ' + url);
+          continue;
+        }
+
+        const responseData = JSON.parse(dataResponse.getContentText());
+
+        if (responseData.items && responseData.items.length > 0) {
+          const headers = Object.keys(responseData.items[0]);
+          const requiredColumns = getRequiredColumns();
+          const allHeaders = Array.from(new Set([...requiredColumns, ...headers]));
+
+          const filteredItems = responseData.items.filter(item => {
+            return !(item.paymentMethod === "pay-later" || item.membershipUsed === "pay-later" || item.stripeToken === "pay-later" || 
+                     item.cancelled === true || item.lateCancelled === true || item.noShow === true);
+          });
+
+          const timeZone = Session.getScriptTimeZone();
+          const datePattern = 'dd/MM/yyyy, hh:mm a';
+
+          if (filteredItems.length > 0) {
+            const newRows = filteredItems.map(item => {
+              if (item.sessionDate) {
+                const parsedDate = new Date(Date.parse(item.sessionDate));
+                if (!isNaN(parsedDate)) {
+                  item.sessionDate = Utilities.formatDate(parsedDate, timeZone, datePattern);
+                }
+              }
+
+              if (item.soldBy) {
+                item.soldBy = formatSoldBy(item.soldBy);
+              }
+
+              return allHeaders.map(header => item[header] || '');
+            });
+
+            if (!headerAppended) {
+              sheet.appendRow(allHeaders);
+              headerAppended = true;
+            }
+            sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
+            Logger.log(newRows.length + ' rows appended to the "' + sheetName + '" sheet from ' + url);
+          } else {
+            Logger.log('No data found after filtering for ' + sheetName + ' sheet from ' + url);
+          }
+        } else {
+          Logger.log('No data found for ' + sheetName + ' sheet from ' + url);
+        }
+      } catch (error) {
+        Logger.log('Error fetching data from URL: ' + url + ' | Error: ' + error.message);
+      }
+    }
+    addFormulas(sheet);
+  }
+}
+
+function fetchAndAppendSalesData(spreadsheet, cookie) {
+  const endpoints = {
+    'Sales': [
+      {
+        url: 'https://reports-api.momence.com/host/13752/reports/total-sales?computedSaleValue=true&timeZone=Asia%2FCalcuttause&BookedEntityDateRange=false&excludeMembershipRenews=false&locationId=29821',
+        source: 'Supreme HQ, Bandra'
+      },
+      {
+        url: 'https://reports-api.momence.com/host/33905/reports/total-sales?computedSaleValue=true&timeZone=Asia%2FCalcuttause&BookedEntityDateRange=false&excludeMembershipRenews=false',
+        source: 'Kenkere House'
+      },
+      {
+        url: 'https://reports-api.momence.com/host/13752/reports/total-sales?computedSaleValue=true&timeZone=Asia%2FCalcuttause&BookedEntityDateRange=false&excludeMembershipRenews=false&locationId=9030',
+        source: 'Kwality House, Kemps Corner'
+      }
+    ]
+  };
+
+  const dataHeaders = {
+    'Accept': 'application/json',
+    'Cookie': cookie,
+  };
+
+  for (const sheetName in endpoints) {
+    const dataUrls = endpoints[sheetName];
+    const sheet = getOrCreateSheet(spreadsheet, sheetName);
+
+    let allRows = [];
+    const headersArray = ['memberId', 'customerName', 'customerEmail', 'saleItemId', 'paymentCategory', 'paymentDate', 'paymentValue', 
+                          'paidInMoneyCredits', 'paymentVat', 'paymentItem', 'paymentStatus', 'paymentMethod', 
+                          'paymentTransactionId', 'stripeToken', 'currency', 'refunded', 'soldBy', 'source', 'Item Category'];
+
+    for (const { url, source } of dataUrls) {
+      const dataResponse = UrlFetchApp.fetch(url, {
+        method: 'GET',
+        headers: dataHeaders,
+      });
+
+      if (dataResponse.getResponseCode() !== 200) {
+        Logger.log('Data retrieval failed for ' + sheetName + ' sheet from URL: ' + url);
+        continue;
+      }
+
+      const responseData = JSON.parse(dataResponse.getContentText());
+
+      if (responseData.items && responseData.items.length > 0) {
+        const filteredItems = responseData.items.filter(item => {
+          return !(item.paymentMethod === "pay-later" || item.membershipUsed === "pay-later" || 
+                   item.stripeToken === "pay-later" || item.cancelled || item.lateCancelled || item.noShow);
+        });
+
+        if (filteredItems.length > 0) {
+          const newRows = filteredItems.map(item => {
+            const row = headersArray.slice(0, headersArray.length - 2).map(header => {
+              if (header === 'paymentDate') {
+                return formatDate(item[header]);
+              } else if (header === 'soldBy') {
+                return formatSoldBySales(item[header]);
+              } else {
+                return item[header] || '-';
+              }
+            });
+
+            const isRowEmpty = row.every(value => value === '-');
+            const itemCategory = getItemCategory(item['paymentCategory'], item['paymentItem']);
+
+            if (!isRowEmpty) {
+              return row.concat([source, itemCategory]);
+            }
+          });
+
+          allRows = allRows.concat(newRows);
+        }
+      }
+    }
+
+    if (allRows.length > 0) {
+      sheet.appendRow(headersArray);
+      sheet.getRange(2, 1, allRows.length, headersArray.length).setValues(allRows);
+      formatSheet(sheet, headersArray);
+    }
+  }
+}
+
+function fetchAndAppendNewMembers(spreadsheet, cookie) {
+  const excludedMemberIds = [
+    15337832, 19372741, 16256662, 15341294, 15337329, 1342000, 15300776, 15119005, 15341284, 16288193, 17662321, 1558934, 15336512, 17121545, 16288189, 15339393, 15338258, 16098069, 17086557, 15340788, 15119002, 17080950, 15343486, 15341847, 15341359, 15931331, 15913204, 15913221, 17962795, 17128715, 17124576, 17611091, 17715555, 17662843, 17435973, 15338497, 15337432, 15343252, 15975745, 15343999, 15338313, 15337323, 15343712, 15338496, 15975071, 15339006, 1342012, 18002802, 17441424,116223
+  ];
+
+  const excludedMembershipTypes = [
+    'Flex 30 Single Classes', 'Studio Staff Family / Friend', 'Studio Staff/Family Class', 'Pop up Studio Single class', 'Studio 1 Month Unlimited Membership', 'Studio 1 Month Unlimited.', 'Studio 10 Single Class Pack', 'Studio 12 Class Package', 'Studio 2 Week Unlimited', 'Studio 2 Week Unlimited Membership', 'Studio 20 Single Class Pack', 'Studio 3 Month U/L Monthly Installment', 'Studio 3 Month Unlimited Membership', 'Studio 30 Single Class Pack', 'Studio 4 Class Package', 'Studio 6 Month Unlimited Membership', 'Studio 8 Class Package', 'Studio 8 Class Package.', 'Studio Annual Membership - Monthly Installment', 'Studio Annual Unlimited Membership', 'Studio 8 Class Package', 'Studio 1 Month Unlimited Membership', 'Studio 4 Class Package', 'Studio 1 Month Unlimited Membership', 'Studio Annual Unlimited Membership', 'Studio FLEX 4 Class', 'Studio Newcomers 2 Week Unlimited Membership', 'Studio Single class', 'Studio Single Class', 'The BURN Package', 'V\\Day Special: Shared Studio 8 Class Package', 'Studio Private Class', 'Virtual Private Class', 'Studio Private Class', 'Pop up Studio Single class ', 'Studio Happy Hour Private', 'pay-later', 'V\\Day Special: Shared Studio 8 Class Package'
+  ];
+
+  const endpoints = {
+    New: [
+      'https://api.momence.com/host/33905/reports/new-visitors/report-runs/{value}',
+      'https://api.momence.com/host/13752/reports/new-visitors/report-runs/{value}'
+    ],
+  };
+
+  for (const sheetName in endpoints) {
+    const dataUrls = endpoints[sheetName];
+    const sheet = getOrCreateSheet(spreadsheet, sheetName);
+
+    let newRows = [];
+    let headersWritten = false;
+    let headers = [];
+
+    const dateColumns = {
+      'New': ['firstVisitDate']
+    };
+
+    for (const dataUrl of dataUrls) {
+      let finalUrl = dataUrl;
+
+      if (dataUrl.includes('{value}')) {
+        const reportRunValue = fetchNewReportRunValue(cookie, dataUrl.includes('33905') ? '33905' : '13752');
+        if (!reportRunValue) {
+          Logger.log('Failed to fetch report run value.');
+          continue;
+        }
+        finalUrl = dataUrl.replace('{value}', reportRunValue);
+      }
+
+      Logger.log('Fetching data from URL: ' + finalUrl);
+      const responseData = fetchDataFromApi(finalUrl, cookie);
+      if (!responseData || !responseData.reportData || !responseData.reportData.items) continue;
+
+      headers = Object.keys(responseData.reportData.items[0]);
+
+      const filteredItems = responseData.reportData.items.filter(item => {
+        return !(excludedMemberIds.includes(item.memberId) ||
+          excludedMembershipTypes.includes(item.membershipUsed) ||
+          item.paymentMethod === "pay-later");
+      });
+
+      if (!headersWritten) {
+        sheet.appendRow([...headers, 'Full Name', 'Unique1', 'Unique2', 'Trainer', 'New']);
+        headersWritten = true;
+      }
+
+      newRows = filteredItems.map(item => {
+        return [
+          ...headers.map(header => (header in item ? formatData(header, item[header], dateColumns[sheetName]) : '')),
+          `${item['firstName'] || ''} ${item['lastName'] || ''}`,
+          '', '', '', ''
+        ];
+      });
+
+      sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
+    }
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      const unique1Range = sheet.getRange(2, headers.length + 2, lastRow - 1);
+      unique1Range.setFormula('=textjoin(,,F2,I2,G2)');
+      
+      const unique2Range = sheet.getRange(2, headers.length + 3, lastRow - 1);
+      unique2Range.setFormula('=TEXTJOIN(,,F2,I2,G2,A2)');
+      
+      const trainerRange = sheet.getRange(2, headers.length + 4, lastRow - 1);
+      trainerRange.setFormula('=INDEX(Bookings!$Y$2:$Y,MATCH(N2,Bookings!$AD$2:$AD,0))');
+      
+      const newRange1 = sheet.getRange(2, headers.length + 5);
+      newRange1.setFormula('=ARRAYFORMULA(IFERROR(IF(O2:O<>"", VLOOKUP(O2:O,Bookings!AE1:AG,2,0),""),"-"))');
+    }
+
+    formatNewSheet(sheet, headers.length + 5);
+  }
+}
+
+function fetchAndAppendSessionsData(spreadsheet, cookie) {
+  const endpoints = {
+    'Sessions': [
+      'https://api.momence.com/host/33905/sessions',
+      'https://readonly-api.momence.com/host/13752/sessions'
+    ]
+  };
+
+  let logSheet = spreadsheet.getSheetByName('Logs');
+  if (!logSheet) {
+    logSheet = spreadsheet.insertSheet('Logs');
+  }
+
+  const dataHeaders = {
+    'Accept': 'application/json',
+    'Cookie': cookie,
+  };
+
+  const startDate = new Date('2023-07-01T00:00:00+05:30');
+  const startDateString = startDate.toISOString();
+
+  const endDate = new Date('2025-12-31T23:59:59+05:30');
+  const endDateString = endDate.toISOString();
+
+  const teacherIdMap = {
+    53133: 'Anisha Shah',
+    90483: 'Saniya Jaiswal',
+    54196: 'Atulan Purohit',
+    54200: 'Janhavi Jain',
+    79695: 'Kajol Kanchan',
+    81297: 'Karanvir Bhatia',
+    54169: 'Mrigakshi Jaiswal',
+    54195: 'Pranjali Jain',
+    54199: 'Reshma Sharma',
+    54175: 'Richard D\'Costa',
+    54176: 'Rohan Dahima',
+    53134: 'Saniya Jaiswal',
+    76964: 'Upasna Paranjpe',
+    54197: 'Vivaran Dhasmana',
+    78228: 'Anisha Shah',
+    80638: 'Kajol Kanchan',
+    78230: 'Karan Bhatia',
+    78229: 'Pranjali Jain',
+    69710: 'Pushyank Nahar',
+    69709: 'Shruti Kulkarni',
+    81814: 'Vivaran Dhasmana',
+    92340: 'Shruti Suresh',
+    92612: 'Karan Bhatia',
+    116223: 'Cauveri Vikrant',
+    117822: 'Poojitha Bhaskar'
+  };
+
+  for (const sheetName in endpoints) {
+    try {
+      const baseUrls = endpoints[sheetName];
+      let page = 0;
+      let hasMoreData = true;
+      let isFirstApiCall = true;
+
+      const headers = ['id', 'name', 'dateTime', 'duration', 'maxParticipants', 'level', 'recurring', 'capacity', 'inPerson', 'location', 'locationId', 'teacherId', 'originalTeacherId', 'type', 'ticketPriceType', 'fixedticketprice', 'freeEvent', 'isDraft', 'paymentPlanExists', 'participants', 'allowWaitlist', 'isCancelled', 'numberOfWaitingCustomers', 'recurringIsLast', 'sessionRecurringSeriesId', 'sessionTemplateId', 'startsAt', 'isAutosubstituted', 'isAutosubstituteRequested', 'checkIns', 'Trainer', 'Status', 'Unique', 'Day', 'Time', 'Level'];
+
+      while (hasMoreData) {
+        hasMoreData = false;
+        for (const baseUrl of baseUrls) {
+          const dataUrl = `${baseUrl}?sortOrder=DESC&status[]=published&status[]=unpublished&timeZone=Asia%2FKolkata&grouped=false&past=true&pageSize=5000&page=${page}&dateFrom=${startDateString}&dateTo=${endDateString}`;
+          const sheet = getOrCreateSheet(spreadsheet, sheetName);
+
+          if (isFirstApiCall && page === 0) {
+            sheet.clear();
+            isFirstApiCall = false;
+          }
+
+          const dataResponse = UrlFetchApp.fetch(dataUrl, {
+            method: 'GET',
+            headers: dataHeaders,
+          });
+
+          if (dataResponse.getResponseCode() !== 200) {
+            Logger.log('Data retrieval failed for ' + sheetName + ' sheet.');
+            logSheet.appendRow([new Date(), sheetName, 'Data retrieval failed']);
+            continue;
+          }
+
+          const responseData = JSON.parse(dataResponse.getContentText());
+
+          if (responseData.payload && responseData.payload.length > 0) {
+            if (page === 0 && sheet.getLastRow() === 0) {
+              sheet.appendRow(headers);
+              Logger.log('Added headers to the "' + sheetName + '" sheet.');
+            }
+
+            const currentTime = new Date();
+            const newRows = responseData.payload.map(item => {
+              const row = headers.map(header => {
+                if (header === 'Trainer') {
+                  return teacherIdMap[item.teacherId] || '';
+                } else if (header === 'Status') {
+                  const sessionTime = new Date(item['dateTime']);
+                  const sessionEndTime = new Date(sessionTime.getTime() + item['duration'] * 60000);
+                  if (currentTime >= sessionTime && currentTime <= new Date(sessionEndTime.getTime() + 3600000)) {
+                    return 'Ongoing';
+                  } else if (currentTime < sessionTime) {
+                    return 'Upcoming';
+                  } else {
+                    return 'Completed';
+                  }
+                } else if (['dateTime', 'startsAt', 'endsAt'].includes(header)) {
+                  const date = new Date(item[header]);
+                  return Utilities.formatDate(date, 'Asia/Kolkata', 'dd/MM/yyyy, HH:mm:ss');
+                } else {
+                  return item[header];
+                }
+              });
+              row.push('');
+              return row;
+            });
+
+            const validRows = newRows.filter(row => row.slice(0, row.length - 1).some(cell => cell !== ''));
+
+            sheet.getRange(sheet.getLastRow() + 1, 1, validRows.length, validRows[0].length).setValues(validRows);
+            Logger.log(validRows.length + ' rows appended to the "' + sheetName + '" sheet.');
+
+            hasMoreData = true;
+          } else {
+            Logger.log('No more data for ' + sheetName + ' sheet.');
+          }
+        }
+
+        page++;
+      }
+
+      const sheet = spreadsheet.getSheetByName(sheetName);
+      if (sheet) {
+        const lastRow = sheet.getLastRow();
+        if (lastRow > 1) {
+          const uniqueFormula = '=ARRAYFORMULA(IF(A2:A<>"", AE2:AE & AA2:AA & J2:J, ""))';
+          const dayFormula = '=ARRAYFORMULA(if($AA$2:$AA<>"",TEXT($AA2:$AA, "dddd"),""))';
+          const timeFormula = '=ARRAYFORMULA(if($AA$2:$AA<>"",TEXT($AA2:$AA, "HH:MM:SS"),""))';
+          const levelFormula = '=CLEANED_CLASS(B2:B)';
+
+          sheet.getRange('AG2').setFormula(uniqueFormula);
+          sheet.getRange('AH2').setFormula(dayFormula);
+          sheet.getRange('AI2').setFormula(timeFormula);
+          sheet.getRange('AJ2').setFormula(levelFormula);
+
+          formatSheet(sheet, headers.length);
+        }
+      }
+    } catch (error) {
+      Logger.log('Error processing ' + sheetName + ': ' + error);
+      logSheet.appendRow([new Date(), sheetName, 'Error: ' + error]);
+    }
+  }
+}
+
+function getOrCreateSheet(spreadsheet, sheetName) {
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(sheetName);
+    Logger.log('Created a new "' + sheetName + '" sheet.');
+  } else {
+    sheet.clearContents();
+  }
+  return sheet;
+}
+
+function getRequiredColumns() {
+  return ['memberId', 'saleDate', 'customerName', 'customerEmail', 'saleValue', 'currency', 'saleItem', 'saleId', 'sessionDate', 'paymentMethod', 'membershipUsed', 'stripeToken', 'refunded', 'vat', 'vatCountry', 'locationName', 'soldBy', 'usedMembership', 'cancelled', 'lateCancelled', 'noShow', 'teacher','homeLocation'];
+}
+
+function addFormulas(sheet) {
+  const headersRange = sheet.getRange("X1:AH1");
+  headersRange.setValues([
+    ["Class No", "Instructor", "Staff", "New", "Month", "Year", "Unique1", "Unique2", "New1","Converted On","Converted With"]
+  ]);
+
+  const x2Formula = "=ARRAYFORMULA(IF(A2:A=\"\", \"\", COUNTIFS(SORT(A$2:A, I$2:I, TRUE), A2:A, SORT(TEXT(I$2:I, \"yyyy-mm-dd hh:mm:ss\") & \" \" & A$2:A, I$2:I, TRUE), \"<=\" & TEXT(I2:I, \"yyyy-mm-dd hh:mm:ss\") & \" \" & A2:A)))";
+  const y2Formula = "=TRAINERNAME(V2:V)";
+  const z2Formula = "=ISSTAFF(C2:C,A2:A,K2:K)";
+  const aaFormula = "=NEW_2(A2:A,K2:K,X2:X,G2:G,C2:C)";
+  const abFormula = "=ARRAYFORMULA(if($I$2:$I<>\"\", month($I$2:$I), \"\"))";
+  const acFormula = "=ARRAYFORMULA(if($I$2:$I<>\"\", year($I$2:$I), \"\"))";
+  const adFormula = "=TEXTJOIN(,,$I2,$P2,$G2)";
+  const aeFormula = "=TEXTJOIN(,,$I2,$P2,$G2,$A2)";
+  const afFormula = '=if($AA2<>"",$AA2,"")';
+  const agFormula = '=CONVERTEDON(AA2:AA,A2:A,I2:I,K2:K,X2:X)';  
+  const ahFormula = '=CONVERTEDWITH(AA2:AA,X2:X,A2:A,I2:I,K2:K)';
+
+  sheet.getRange("X2").setFormula(x2Formula);
+  sheet.getRange("Y2").setFormula(y2Formula);
+  sheet.getRange("Z2").setFormula(z2Formula);
+  sheet.getRange("AA2").setFormula(aaFormula);
+  sheet.getRange("AB2").setFormula(abFormula);
+  sheet.getRange("AC2").setFormula(acFormula);
+  sheet.getRange("AD2:AD").setFormula(adFormula);  
+  sheet.getRange("AE2:AE").setFormula(aeFormula);  
+  sheet.getRange("AF2:AF").setFormula(afFormula);  
+  sheet.getRange("AG2").setFormula(afFormula); 
+  sheet.getRange("AH2").setFormula(afFormula); 
+
+  formatSheet(sheet, 34);
+}
+
+function formatSoldBy(email) {
+  const soldByMapping = {
+    'tahira@physique57mumbai.com': 'Tahira Sayyed',
+    'shipra@physique57mumbai.com': 'Shipra Bhika',
+    'priyanka@physique57mumbai.com': 'Priyanka Abnave',
+    'akshay@physique57mumbai.com': 'Akshay Rane',
+    'imran@physique57mumbai.com': 'Imran Shaikh',
+    'sheetal@physique57mumbai.com': 'Sheetal Kataria',
+    'manisha@physique57mumbai.com': 'Manisha Rathod',
+    'zahur@physique57mumbai.com': 'Zahur Shaikh',
+    'mitali@physique57india.com': 'Mitali Kumar',
+    'jimmeey@physique57india.com': 'Jimmeey Gondaa',
+    'saachi@physique57india.com': 'Saachi Shetty',
+    'jan@themomence.com': 'Jan Momence',
+    'shanoob@physique57bengaluru.com': 'Shanoob',
+    'shifa@physique57bengaluru.com': 'Shifa Ali',
+    'santhosh@physique57bengaluru.com': 'Santhosh Kumar',
+    'hazira@physique57bengaluru.com': 'Hazira Begum',
+    'api@physique57bengaluru.com': 'Api Serou',
+    'kajol@physique57mumbai.com': 'Kajol Kanchan',
+    'N/A': 'Admin Admin',
+    '-': 'Admin Admin'
+  };
+
+  return soldByMapping[email] || email;
+}
+
+function formatSoldBySales(email) {
+  const soldByMapping = {
+    'tahira@physique57mumbai.com': 'Tahira Sayyed',
+    'shipra@physique57mumbai.com': 'Shipra Bhika',
+    'priyanka@physique57mumbai.com': 'Priyanka Abnave',
+    'akshay@physique57mumbai.com': 'Akshay Rane',
+    'imran@physique57mumbai.com': 'Imran Shaikh',
+    'sheetal@physique57mumbai.com': 'Sheetal Kataria',
+    'manisha@physique57mumbai.com': 'Manisha Rathod',
+    'zahur@physique57mumbai.com': 'Zahur Shaikh',
+    'mitali@physique57india.com': 'Admin Admin',
+    'jimmeey@physique57india.com': 'Admin Admin',
+    'saachi@physique57india.com': 'Admin Admin',
+    'jan@themomence.com': 'Admin Admin',
+    'shanoob@physique57bengaluru.com': 'Admin Admin',
+    'shifa@physique57bengaluru.com': 'Admin Admin',
+    'gaurav@physique57mumbai.com': 'Admin Admin',
+    'info@physique57india.com': 'Admin Admin',
+    'prathap@physique57bengaluru.com': 'Prathap Kp',
+    'nizamuddin@physique57bengaluru.com': 'Admin Admin',
+    'rajkumar@physique57bengaluru.com': 'Admin Admin',
+    'havila@physique57bengaluru.com': 'Admin Admin',
+    'shahida@physique57bengaluru.com': 'Admin Admin',
+    'santhosh@physique57bengaluru.com': 'Santhosh Kumar',
+    'api@physique57bengaluru.com': 'Api Serou',
+    'kajol@physique57mumbai.com': 'Admin Admin',
+    'N/A': 'Admin Admin',
+    '-': 'Admin Admin'
+  };
+
+  return soldByMapping[email] || 'Admin Admin';
+}
+
+function getItemCategory(paymentCategory, paymentItem) {
+  if (paymentCategory === 'product') {
+    return 'Boutique';
+  } else if (paymentCategory === 'event') {
+    return 'Sessions';
+  } else if (paymentItem) {
+    if (paymentItem.includes('Unlimited')) {
+      return 'Membership';
+    } else if (paymentItem.includes('Pack') || paymentItem.includes('Package')) {
+      return 'Class Package';
+    } else if (paymentItem.includes('Private')) {
+      return 'Private Sessions';
+    } else if (paymentItem === 'Studio Single class' || paymentItem === 'Studio Single Class') {
+      return 'Single Classes';
+    }
+  }
+  return 'Other';
+}
+
+function formatSheet(sheet, columns) {
+  const range = sheet.getRange(1, 1, sheet.getLastRow(), columns);
+  range.setBorder(false, false, false, false, false, true, '#000000', SpreadsheetApp.BorderStyle.DOTTED);
+  range.setBackground('#0ba3ef');
+  range.setFontColor('#ffffff');
+  range.setFontWeight('bold');
+  range.setHorizontalAlignment('center');
+  range.setVerticalAlignment('middle');
+  range.setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+  range.setFontSize(10);
+  range.setFontFamily("Play");
+
+  const dataRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, columns);
+  dataRange.setBorder(false, false, false, false, false, true, '#000000', SpreadsheetApp.BorderStyle.DOTTED);
+  dataRange.setBackground('#ffffff');
+  dataRange.setFontColor('#000000');
+  dataRange.setHorizontalAlignment('left');
+  dataRange.setVerticalAlignment('middle');
+  dataRange.setFontSize(8);
+  dataRange.setFontWeight('regular');
+  dataRange.setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+  dataRange.setFontFamily("Play");
+}
+
+function fetchDataFromApi(apiUrl, cookie) {
+  const dataHeaders = {
+    'Accept': 'application/json',
+    'Cookie': cookie,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+  };
+
+  const options = {
+    method: 'GET',
+    headers: dataHeaders,
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(apiUrl, options);
+    Logger.log('Response Code: ' + response.getResponseCode());
+    if (response.getResponseCode() === 200) {
+      const responseData = JSON.parse(response.getContentText());
+      Logger.log('API Response: ' + JSON.stringify(responseData));
+      return responseData;
+    } else {
+      Logger.log('Error response code: ' + response.getResponseCode());
+      Logger.log('Error response content: ' + response.getContentText());
+      return null;
+    }
+  } catch (error) {
+    Logger.log('Error fetching data from API: ' + error.message);
+    return null;
+  }
+}
+
+function fetchNewReportRunValue(cookie, hostId) {
+  const reportRunPayload = {
+    timeZone: "Asia/Kolkata",
+    startDate: "2023-09-24T18:30:00.000Z",
+    endDate: "2025-12-31T18:29:59.999Z",
+    day: "2024-09-02",
+    includeVatInRevenue: true,
+    computedSaleValue: true,
+  };
+
+  const reportRunHeaders = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'Cookie': cookie,
+  };
+
+  const reportRunResponse = UrlFetchApp.fetch(`https://api.momence.com/host/${hostId}/reports/new-visitors/async`, {
+    method: 'POST',
+    headers: reportRunHeaders,
+    payload: JSON.stringify(reportRunPayload),
+  });
+
+  if (reportRunResponse.getResponseCode() !== 200) {
+    Logger.log('Fetching report run value failed.');
+    return null;
+  }
+
+  Utilities.sleep(15000);
+
+  const responseData = JSON.parse(reportRunResponse.getContentText());
+  return responseData.reportRunId;
+}
+
+function formatData(header, value, dateColumns) {
+  const timeZone = Session.getScriptTimeZone();
+  const datePattern = 'dd/MM/yyyy, hh:mm a';
+  
+  if (dateColumns && dateColumns.includes(header)) {
+    if (value instanceof Date) {
+      return Utilities.formatDate(value, timeZone, datePattern);
+    } else {
+      const parsedDate = new Date(Date.parse(value));
+      return isNaN(parsedDate) ? value : Utilities.formatDate(parsedDate, timeZone, datePattern);
+    }
+  }
+  return value;
+}
+
+function formatNewSheet(sheet, additionalColumns) {
+  const range = sheet.getRange(1, 1, sheet.getLastRow(), additionalColumns);
+  range.setBorder(false, false, false, false, false, true, '#000000', SpreadsheetApp.BorderStyle.DOTTED);
+  range.setBackground('#0ba3ef');
+  range.setFontColor('#ffffff');
+  range.setFontWeight('regular');
+  range.setHorizontalAlignment('center');
+  range.setVerticalAlignment('middle');
+  range.setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+  range.setFontSize(10);
+  range.setFontFamily("Play");
+
+  const dataRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, additionalColumns);
+  dataRange.setBorder(false, false, false, false, false, true, '#000000', SpreadsheetApp.BorderStyle.DOTTED);
+  dataRange.setBackground('#ffffff');
+  dataRange.setFontColor('#000000');
+  dataRange.setHorizontalAlignment('left');
+  dataRange.setVerticalAlignment('middle');
+  dataRange.setFontSize(8);
+  dataRange.setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+}
